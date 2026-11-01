@@ -39,6 +39,7 @@ typedef struct {
 
 STATIC EFI_HANDLE  mImage;
 UINT64 EFIAPI DarwinCurrentEl (VOID);
+extern UINT64 mDarwinFbBase;
 VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
 
 #define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
@@ -809,6 +810,31 @@ Boot (
           READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
   DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
   DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmarks the loader handoff before the kernel branch.\n"));
+  //
+  // Put the hand-off facts on the framebuffer itself. The DEBUG lines above only
+  // reach a serial port, which this board does not expose, so a photograph of the
+  // screen is the only way to confirm what the kernel was actually given.
+  //
+  {
+    CHAR16 Line[96];
+    UINTN  Row = 0;
+
+    mDarwinFbBase = Video[0];
+    UnicodeSPrint (Line, sizeof (Line), L"HANDOFF kernel va %lx pa %lx", Kernel.Base, Address);
+    DiagDraw (Line, Row++);
+    UnicodeSPrint (Line, sizeof (Line), L"ENTRY pa %lx owned %lx", Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
+    DiagDraw (Line, Row++);
+    UnicodeSPrint (Line, sizeof (Line), L"WORDS %08x %08x %08x %08x",
+                   U32 ((CONST VOID *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
+                   U32 ((CONST VOID *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 4)),
+                   U32 ((CONST VOID *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 8)),
+                   U32 ((CONST VOID *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 12)));
+    DiagDraw (Line, Row++);
+    UnicodeSPrint (Line, sizeof (Line), L"VIDEO base %lx row %lx %lux%lu %lu bpp",
+                   Video[0], Video[2], Video[3], Video[4], Video[5]);
+    DiagDraw (Line, Row++);
+  }
+
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
