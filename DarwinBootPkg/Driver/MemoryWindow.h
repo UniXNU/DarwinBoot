@@ -224,4 +224,92 @@ DarwinWindowExclusions (
   return Count;
 }
 
+// Free memory outside the window, for a kernel driver that manages memory of its own (a DRAM bank too far from the
+// window for XNU's page array). Table holds Capacity (base, size) pairs like the excluded-range table; it gets the
+// largest runs of EfiConventionalMemory that lie outside [Base, Base + Size), aligned inward to Align and at least
+// Minimum bytes long, in ascending order, with unused pairs zeroed. Only free memory counts: after ExitBootServices
+// nothing of the firmware uses it, while loader and boot services memory may still hold what the hand-off reads.
+// Returns the number of ranges and their bytes.
+STATIC
+UINTN
+DarwinOutsideRanges (
+  CONST VOID  *Map,
+  UINTN       MapSize,
+  UINTN       Stride,
+  UINT64      Base,
+  UINT64      Size,
+  UINT64      Align,
+  UINT64      Minimum,
+  UINT8       *Table,
+  UINTN       Capacity,
+  UINT64      *Bytes
+  )
+{
+  UINTN   Offset;
+  UINTN   Count;
+  UINTN   Index;
+  UINTN   Least;
+  UINTN   Piece;
+  UINT64  Cursor;
+  UINT64  Start;
+  UINT64  End;
+  UINT64  Next;
+  UINT64  From[2];
+  UINT64  To[2];
+  UINT64  Limit;
+  BOOLEAN Found;
+
+  Count = 0;
+  *Bytes = 0;
+  Limit = Base + Size;
+  for (Cursor = 0; Capacity != 0; Cursor = End) {
+    Found = FALSE;
+    Next = MAX_UINT64;
+    for (Offset = 0; Offset + Stride <= MapSize; Offset += Stride) {
+      if (DarwinDescriptorRange ((CONST EFI_MEMORY_DESCRIPTOR *)((CONST UINT8 *)Map + Offset), TRUE, &Start, &End) &&
+          (End > Cursor)) {
+        if (Start < Cursor) { Start = Cursor; }
+        if (Start < Next) { Next = Start; Found = TRUE; }
+      }
+    }
+    if (!Found) { break; }
+    Start = Next;
+    End = DarwinRunEnd (Map, MapSize, Stride, TRUE, Start, MAX_UINT64);
+    if (End <= Start) { break; }
+    // The parts of the run below and above the window.
+    From[0] = Start; To[0] = (End < Base) ? End : Base;
+    From[1] = (Start > Limit) ? Start : Limit; To[1] = End;
+    for (Piece = 0; Piece < 2; Piece++) {
+      if (From[Piece] >= To[Piece]) { continue; }
+      From[Piece] = (From[Piece] + Align - 1) & ~(Align - 1);
+      To[Piece] &= ~(Align - 1);
+      if ((From[Piece] >= To[Piece]) || (To[Piece] - From[Piece] < Minimum)) { continue; }
+      if (Count < Capacity) {
+        DarwinRangeSet (Table, Count++, From[Piece], To[Piece] - From[Piece]);
+        continue;
+      }
+      Least = 0;
+      for (Index = 1; Index < Capacity; Index++) {
+        if (DarwinRangeSize (Table, Index) < DarwinRangeSize (Table, Least)) { Least = Index; }
+      }
+      if (To[Piece] - From[Piece] > DarwinRangeSize (Table, Least)) {
+        DarwinRangeSet (Table, Least, From[Piece], To[Piece] - From[Piece]);
+      }
+    }
+  }
+  // Ascending by base.
+  for (Index = 1; Index < Count; Index++) {
+    for (Offset = Index; (Offset > 0) && (DarwinRangeBase (Table, Offset - 1) > DarwinRangeBase (Table, Offset)); Offset--) {
+      Start = DarwinRangeBase (Table, Offset); End = DarwinRangeSize (Table, Offset);
+      DarwinRangeSet (Table, Offset, DarwinRangeBase (Table, Offset - 1), DarwinRangeSize (Table, Offset - 1));
+      DarwinRangeSet (Table, Offset - 1, Start, End);
+    }
+  }
+  for (Index = 0; Index < Capacity; Index++) {
+    if (Index < Count) { *Bytes += DarwinRangeSize (Table, Index); }
+    else { DarwinRangeSet (Table, Index, 0, 0); }
+  }
+  return Count;
+}
+
 #endif

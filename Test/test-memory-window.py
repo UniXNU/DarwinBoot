@@ -98,6 +98,9 @@ UINT64 run_end(const void *map, size_t size, size_t stride, int free_only, UINT6
   return DarwinRunEnd(map, size, stride, free_only, address, limit);
 }
 UINT64 reserve(UINT64 window) { return DARWIN_WINDOW_RESERVE(window); }
+size_t outside(const void *map, size_t size, size_t stride, UINT8 *table, UINT64 *bytes) {  /* tested in test-memory-outside.py */
+  return DarwinOutsideRanges(map, size, stride, 0, 0, 0x10000, 0x100000, table, 0, bytes);
+}
 ''')
     library = work / 'window.dylib'
     subprocess.run(['clang', '-Wall', '-Wextra', '-Werror', '-fsanitize=undefined', '-fno-sanitize-recover=all',

@@ -661,6 +661,29 @@ PlaceImage (
   Layout->Used = ALIGN_VALUE (Layout->Policy + PolicySize, SIZE_16KB) - Address;
 }
 
+// The table for free memory outside the window (MemoryWindow.h DarwinOutsideRanges): the property
+// darwinboot-memory-outside of the flattened tree, whose value is empty (base, size) pairs. A property record is a
+// 32-byte name, a 32-bit length and the value. FALSE when the tree has none or its value is not such a table.
+STATIC
+BOOLEAN
+FindOutsideTable (CONST UINT8 *Tree, UINTN TreeSize, UINTN *TableOffset, UINTN *Capacity)
+{
+  STATIC CONST CHAR8  Name[32] = "darwinboot-memory-outside";
+  UINTN               Offset;
+  UINT32              Length;
+
+  for (Offset = 0; Offset + 36 <= TreeSize; Offset += 4) {
+    if (CompareMem (Tree + Offset, Name, sizeof (Name)) != 0) { continue; }
+    Length = ReadUnaligned32 ((CONST UINT32 *)(Tree + Offset + 32)) & 0x7fffffff;
+    if ((Length < 16) || (Length & 15) || (Length > TreeSize - Offset - 36) ||
+        !IsZeroBuffer (Tree + Offset + 36, Length)) { return FALSE; }
+    *TableOffset = Offset + 36;
+    *Capacity = Length / 16;
+    return TRUE;
+  }
+  return FALSE;
+}
+
 // Fill the device tree's table from a memory map and report the usable bytes as the memory size. FALSE when the
 // head is no longer whole, which the head allocation rules out.
 STATIC
@@ -798,6 +821,10 @@ Boot (
   UINT64                          Allocated;
   UINT64                          Cursor;
   UINTN                           InputsOffset;
+  UINTN                           OutsideOffset;
+  UINTN                           OutsideCapacity;
+  UINTN                           OutsideCount;
+  UINT64                          OutsideBytes;
   DARWIN_LOADER_INPUT             Inputs[DARWIN_INPUT_COUNT];
 
   (VOID)This;
@@ -862,6 +889,9 @@ Boot (
   ExcludedOffset = MAX_UINTN;
   ExcludedCapacity = 0;
   InputsOffset = MAX_UINTN;
+  OutsideOffset = MAX_UINTN;
+  OutsideCapacity = 0;
+  if (!FindOutsideTable (Tree, TreeSize, &OutsideOffset, &OutsideCapacity)) { OutsideOffset = MAX_UINTN; }
   if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked, &ExcludedOffset, &ExcludedCapacity, &InputsOffset) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
@@ -1002,6 +1032,18 @@ Boot (
   if (EFI_ERROR (Status)) { goto Fail; }
   Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
          Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
+  if (OutsideOffset != MAX_UINTN) {
+    // As this map gives it; the table XNU reads comes from the map ExitBootServices accepts.
+    OutsideCount = DarwinOutsideRanges (Map, MapSize, Stride, Address, WindowSize, SIZE_64KB, SIZE_1MB,
+                                        (UINT8 *)(UINTN)(TreeAddress + OutsideOffset), OutsideCapacity, &OutsideBytes);
+    Print (L"DARWINBOOT: free memory outside the window: %lu ranges of %lu, 0x%lx bytes\n",
+           (UINT64)OutsideCount, (UINT64)OutsideCapacity, OutsideBytes);
+    for (Index = 0; Index < OutsideCount; Index++) {
+      Print (L"DARWINBOOT: outside 0x%lx + 0x%lx\n",
+             DarwinRangeBase ((UINT8 *)(UINTN)(TreeAddress + OutsideOffset), Index),
+             DarwinRangeSize ((UINT8 *)(UINTN)(TreeAddress + OutsideOffset), Index));
+    }
+  }
   if (InputsOffset != MAX_UINTN) {
     // The inputs as this map gives them; the records XNU reads come from the map ExitBootServices accepts.
     DarwinDescribeInputs (Map, &MapSize, Capacity, Stride, Address, WindowSize, ExcludedOffset != MAX_UINTN, Inputs);
@@ -1067,8 +1109,12 @@ Boot (
       if (Attempt == 0) { goto Fail; }
       CpuDeadLoop ();
     }
-    // No boot service runs between this map and ExitBootServices, so the records and the table describe the
-    // memory XNU gets.
+    // No boot service runs between this map and ExitBootServices, so the records and the tables describe the
+    // memory XNU gets and the free memory outside it.
+    if (OutsideOffset != MAX_UINTN) {
+      OutsideCount = DarwinOutsideRanges (Map, MapSize, Stride, Address, WindowSize, SIZE_64KB, SIZE_1MB,
+                                          (UINT8 *)(UINTN)(TreeAddress + OutsideOffset), OutsideCapacity, &OutsideBytes);
+    }
     if (InputsOffset != MAX_UINTN) {
       DarwinDescribeInputs (Map, &MapSize, Capacity, Stride, Address, WindowSize, Excluded != NULL, Inputs);
       DarwinWriteInputs ((UINT8 *)(UINTN)(TreeAddress + InputsOffset), Inputs);
