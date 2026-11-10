@@ -27,8 +27,21 @@ may request it. Before the hand-off every usable range leaves the data cache, as
 the firmware must keep free memory mapped; excluded ranges are never touched. With 4 KiB pages XNU's bootstrap
 tables map at most 6 GiB, which bounds the window. The excluded-range hand-off has not run on hardware.
 
+With `/chosen/darwinboot-loader-inputs`, two empty 32-byte records, the loader records where its own inputs lie
+in the firmware's memory map: the payload RAM disk, which is the range the first-stage boot loader's device tree
+names as the initrd (found through the entry argument HOB of the firmware's SEC phase, and verified when the boot
+volume's block device has that size and reads its first and last sector from it), and the boot entry's initrd
+buffer. A record holds base, size, UEFI memory type (-1: none or mixed), state bits (1 located, 2 verified,
+4 inside the window, 8 usable) and usable bytes; the loader prints both as `DARWINBOOT: payload disk` and
+`DARWINBOOT: initrd buffer`. Both inputs are read for the last time before `ExitBootServices` and XNU is told
+neither address, so with the excluded-range table the whole pages of a verified input that lie inside the window
+count as usable memory when boot services data, reserved memory or a usable type describes them. Other types and
+unverified ranges stay excluded. Without the property the loader does not look for its inputs. Not run on
+hardware.
+
 Host checks: `Test/test-memory-window.py` (window selection and the table on synthetic memory maps),
-`Test/test-adt-window.py` (the device tree properties), `Test/test-kernel-parser.py`,
+`Test/test-loader-inputs.py` (the HOB and device tree readers, the input records and their release into the
+table), `Test/test-adt-window.py` (the device tree properties), `Test/test-kernel-parser.py`,
 `Test/test-packed-ramdisk.py` and `Test/window-size.c`.
 
 Build and interface details: [documentation](https://unixnu.com/reference/components).

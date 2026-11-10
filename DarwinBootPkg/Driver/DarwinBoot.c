@@ -8,7 +8,9 @@
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/PrintLib.h>
 #include <Library/UefiLib.h>
+#include <Guid/HobList.h>
 #include <Protocol/UniXNULoader.h>
+#include <Protocol/BlockIo.h>
 #include <Protocol/LoadedImage.h>
 #include <Protocol/GraphicsOutput.h>
 #include <Protocol/SimpleFileSystem.h>
@@ -17,6 +19,7 @@
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
 #include "MemoryWindow.h"
+#include "LoaderInputs.h"
 
 #define WINDOW_SIZE  SIZE_256MB
 #define BLOCK_SIZE   SIZE_2MB
@@ -283,7 +286,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
 
 STATIC
 BOOLEAN
-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked, UINTN *ExcludedOffset, UINTN *ExcludedCapacity)
+AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked, UINTN *ExcludedOffset, UINTN *ExcludedCapacity, UINTN *InputsOffset)
 {
   UINT32 Properties;
   UINT32 Children;
@@ -297,6 +300,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  MemoryCandidate;
   UINTN  ExcludedCandidate;
   UINTN  ExcludedLength;
+  UINTN  InputsCandidate;
   CONST UINT8 *Name;
   UINTN  NameLength;
 
@@ -309,6 +313,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   MemoryCandidate = MAX_UINTN;
   ExcludedCandidate = MAX_UINTN;
   ExcludedLength = 0;
+  InputsCandidate = MAX_UINTN;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
   Children = U32 (Data + *Offset + 4);
@@ -357,6 +362,12 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       ExcludedCandidate = *Offset;
       ExcludedLength = Length;
     }
+    // The records the loader fills with the memory of its inputs (LoaderInputs.h): empty.
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-loader-inputs") == 0) {
+      if ((InputsCandidate != MAX_UINTN) || (Length != DARWIN_INPUT_COUNT * DARWIN_INPUT_RECORD_SIZE) ||
+          !IsZeroBuffer (Data + *Offset, Length)) { return FALSE; }
+      InputsCandidate = *Offset;
+    }
     *Offset += Length;
     if (ALIGN_VALUE (*Offset, 4) > Size) { return FALSE; }
     *Offset = ALIGN_VALUE (*Offset, 4);
@@ -391,9 +402,13 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     *ExcludedOffset = ExcludedCandidate;
     *ExcludedCapacity = ExcludedLength / 16;
   }
+  if (InputsCandidate != MAX_UINTN) {
+    if ((Path != 1) || (*InputsOffset != MAX_UINTN)) { return FALSE; }
+    *InputsOffset = InputsCandidate;
+  }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked, ExcludedOffset, ExcludedCapacity)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked, ExcludedOffset, ExcludedCapacity, InputsOffset)) { return FALSE; }
   }
   return TRUE;
 }
@@ -671,6 +686,56 @@ DescribeWindow (
   return TRUE;
 }
 
+// The entry argument the firmware's SEC phase keeps from the first-stage boot loader: the address of that
+// loader's device tree, as a 64-bit value in this GUID extension HOB.
+STATIC CONST EFI_GUID mEntryArgumentHobGuid = {
+  0xDAEE82E6, 0x8090, 0x4E72, { 0xBF, 0xB9, 0x78, 0xC1, 0x3C, 0xD4, 0xE3, 0x59 }
+};
+
+// Where the loader's inputs lie (LoaderInputs.h). The initrd is the caller's buffer. The payload RAM disk is
+// the range the first-stage loader's device tree names, rounded up to whole sectors as the firmware's block
+// device publishes it; it counts as verified when the boot volume's block device has exactly that size and
+// reads its first and last sector from that memory, which is touched only once the size matches.
+STATIC
+VOID
+LocateInputs (CONST UNIXNU_LOADER_BOOT_REQUEST *Request, DARWIN_LOADER_INPUT *Inputs)
+{
+  EFI_BLOCK_IO_PROTOCOL  *BlockIo;
+  VOID                   *Hob;
+  UINTN                  HobSize;
+  UINT64                 Tree;
+  UINT64                 Start;
+  UINT64                 End;
+  UINT64                 Size;
+  UINT8                  Sector[512];
+
+  ZeroMem (Inputs, DARWIN_INPUT_COUNT * sizeof (*Inputs));
+  if ((Request->Ramdisk != NULL) && (Request->RamdiskSize != 0)) {
+    Inputs[DARWIN_INPUT_INITRD].Base = (UINT64)(UINTN)Request->Ramdisk;
+    Inputs[DARWIN_INPUT_INITRD].Size = Request->RamdiskSize;
+    Inputs[DARWIN_INPUT_INITRD].State = DARWIN_INPUT_LOCATED | DARWIN_INPUT_VERIFIED;
+  }
+  Hob = NULL;
+  if (EFI_ERROR (EfiGetSystemConfigurationTable (&gEfiHobListGuid, &Hob)) || (Hob == NULL)) { return; }
+  HobSize = DarwinHobListSize (Hob, (UINT64)(UINTN)Hob, SIZE_16MB);
+  if ((HobSize == 0) || !DarwinHobValue (Hob, HobSize, (CONST UINT8 *)&mEntryArgumentHobGuid, &Tree) ||
+      (Tree == 0) || (Tree & 3) || !DarwinFdtInitrd ((CONST UINT8 *)(UINTN)Tree, &Start, &End)) { return; }
+  Size = End - Start;
+  if ((Size > MAX_UINT64 - 511) || (ALIGN_VALUE (Size, 512) > MAX_UINT64 - Start)) { return; }
+  Size = ALIGN_VALUE (Size, 512);
+  Inputs[DARWIN_INPUT_PAYLOAD_DISK].Base = Start;
+  Inputs[DARWIN_INPUT_PAYLOAD_DISK].Size = Size;
+  Inputs[DARWIN_INPUT_PAYLOAD_DISK].State = DARWIN_INPUT_LOCATED;
+  if (EFI_ERROR (gBS->HandleProtocol (Request->Volume, &gEfiBlockIoProtocolGuid, (VOID **)&BlockIo)) ||
+      (BlockIo->Media == NULL) || BlockIo->Media->LogicalPartition || !BlockIo->Media->MediaPresent ||
+      (BlockIo->Media->BlockSize != sizeof (Sector)) || (BlockIo->Media->LastBlock != Size / sizeof (Sector) - 1)) { return; }
+  if (EFI_ERROR (BlockIo->ReadBlocks (BlockIo, BlockIo->Media->MediaId, 0, sizeof (Sector), Sector)) ||
+      (CompareMem (Sector, (CONST VOID *)(UINTN)Start, sizeof (Sector)) != 0) ||
+      EFI_ERROR (BlockIo->ReadBlocks (BlockIo, BlockIo->Media->MediaId, BlockIo->Media->LastBlock, sizeof (Sector), Sector)) ||
+      (CompareMem (Sector, (CONST VOID *)(UINTN)(Start + Size - sizeof (Sector)), sizeof (Sector)) != 0)) { return; }
+  Inputs[DARWIN_INPUT_PAYLOAD_DISK].State |= DARWIN_INPUT_VERIFIED;
+}
+
 STATIC
 EFI_STATUS
 EFIAPI
@@ -732,6 +797,8 @@ Boot (
   UINT64                          HeadSize;
   UINT64                          Allocated;
   UINT64                          Cursor;
+  UINTN                           InputsOffset;
+  DARWIN_LOADER_INPUT             Inputs[DARWIN_INPUT_COUNT];
 
   (VOID)This;
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
@@ -794,7 +861,8 @@ Boot (
   KeepPacked = FALSE;
   ExcludedOffset = MAX_UINTN;
   ExcludedCapacity = 0;
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked, &ExcludedOffset, &ExcludedCapacity) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  InputsOffset = MAX_UINTN;
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked, &ExcludedOffset, &ExcludedCapacity, &InputsOffset) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
@@ -928,10 +996,23 @@ Boot (
   FreePool (Tree); Tree = NULL;
   FreePool (TreePath); TreePath = NULL;
   Root->Close (Root); Root = NULL;
+  // Every file is read; the block device is asked once more, and only for a tree that wants the record.
+  if (InputsOffset != MAX_UINTN) { LocateInputs (Request, Inputs); }
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
   if (EFI_ERROR (Status)) { goto Fail; }
   Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
          Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
+  if (InputsOffset != MAX_UINTN) {
+    // The inputs as this map gives them; the records XNU reads come from the map ExitBootServices accepts.
+    DarwinDescribeInputs (Map, &MapSize, Capacity, Stride, Address, WindowSize, ExcludedOffset != MAX_UINTN, Inputs);
+    DarwinWriteInputs ((UINT8 *)(UINTN)(TreeAddress + InputsOffset), Inputs);
+    Print (L"DARWINBOOT: payload disk 0x%lx + 0x%lx type %d state %x usable 0x%lx\n",
+           Inputs[DARWIN_INPUT_PAYLOAD_DISK].Base, Inputs[DARWIN_INPUT_PAYLOAD_DISK].Size, (INT32)Inputs[DARWIN_INPUT_PAYLOAD_DISK].Type,
+           Inputs[DARWIN_INPUT_PAYLOAD_DISK].State, Inputs[DARWIN_INPUT_PAYLOAD_DISK].Usable);
+    Print (L"DARWINBOOT: initrd buffer 0x%lx + 0x%lx type %d state %x usable 0x%lx\n",
+           Inputs[DARWIN_INPUT_INITRD].Base, Inputs[DARWIN_INPUT_INITRD].Size, (INT32)Inputs[DARWIN_INPUT_INITRD].Type,
+           Inputs[DARWIN_INPUT_INITRD].State, Inputs[DARWIN_INPUT_INITRD].Usable);
+  }
   if (ExcludedOffset != MAX_UINTN) {
     // The table as this map gives it; the map ExitBootServices accepts decides the one XNU reads.
     Excluded = (UINT8 *)(UINTN)(TreeAddress + ExcludedOffset);
@@ -962,6 +1043,12 @@ Boot (
   if (Excluded != NULL) {
     DEBUG ((DEBUG_ERROR, "memory   usable 0x%lx  excluded ranges %lu\n", Args->MemorySizeActual, (UINT64)ExcludedCount));
   }
+  if (InputsOffset != MAX_UINTN) {
+    DEBUG ((DEBUG_ERROR, "disk     0x%lx + 0x%lx  type %d  state %x\n", Inputs[DARWIN_INPUT_PAYLOAD_DISK].Base,
+            Inputs[DARWIN_INPUT_PAYLOAD_DISK].Size, (INT32)Inputs[DARWIN_INPUT_PAYLOAD_DISK].Type, Inputs[DARWIN_INPUT_PAYLOAD_DISK].State));
+    DEBUG ((DEBUG_ERROR, "initrd   0x%lx + 0x%lx  type %d  state %x\n", Inputs[DARWIN_INPUT_INITRD].Base,
+            Inputs[DARWIN_INPUT_INITRD].Size, (INT32)Inputs[DARWIN_INPUT_INITRD].Type, Inputs[DARWIN_INPUT_INITRD].State));
+  }
   DEBUG ((DEBUG_ERROR, "video    base 0x%lx  %lux%lu  row %lu bytes  %lu bpp\n", Video[0], Video[3], Video[4], Video[2], Video[5]));
   DEBUG ((DEBUG_ERROR, "entry words %08x %08x %08x %08x\n",
           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
@@ -980,7 +1067,12 @@ Boot (
       if (Attempt == 0) { goto Fail; }
       CpuDeadLoop ();
     }
-    // No boot service runs between this map and ExitBootServices, so the table describes the memory XNU gets.
+    // No boot service runs between this map and ExitBootServices, so the records and the table describe the
+    // memory XNU gets.
+    if (InputsOffset != MAX_UINTN) {
+      DarwinDescribeInputs (Map, &MapSize, Capacity, Stride, Address, WindowSize, Excluded != NULL, Inputs);
+      DarwinWriteInputs ((UINT8 *)(UINTN)(TreeAddress + InputsOffset), Inputs);
+    }
     if ((Excluded != NULL) &&
         !DescribeWindow (Map, MapSize, Stride, Address, WindowSize, HeadSize, Excluded, ExcludedCapacity, Args, &ExcludedCount)) {
       if (Attempt == 0) { Status = EFI_LOAD_ERROR; goto Fail; }

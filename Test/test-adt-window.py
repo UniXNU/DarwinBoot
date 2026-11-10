@@ -14,6 +14,8 @@ preamble = '''
 #include <stddef.h>
 #include <string.h>
 #include "WindowSize.h"
+#define DARWIN_INPUT_COUNT 2
+#define DARWIN_INPUT_RECORD_SIZE 32
 typedef uint8_t UINT8; typedef uint32_t UINT32; typedef uint64_t UINT64;
 typedef size_t UINTN; typedef int BOOLEAN; typedef char CHAR8;
 #define STATIC static
@@ -30,11 +32,11 @@ static UINT32 U32(const void *p) { UINT32 v; memcpy(&v, p, 4); return v; }
 static UINT64 U64(const void *p) { UINT64 v; memcpy(&v, p, 8); return v; }
 '''
 entry = '''
-int parse(const UINT8 *tree, UINTN size, UINT64 *window, UINTN *excluded, UINTN *capacity) {
+int parse(const UINT8 *tree, UINTN size, UINT64 *window, UINTN *excluded, UINTN *capacity, UINTN *inputs) {
   UINTN at = 0, ramdisk = MAX_UINTN, trust = MAX_UINTN, addon = MAX_UINTN, policy = MAX_UINTN;
   BOOLEAN packed = FALSE;
-  *window = 0; *excluded = MAX_UINTN; *capacity = 0;
-  return AdtNode(tree, size, &at, 0, 3, &ramdisk, &trust, &addon, &policy, window, &packed, excluded, capacity) && at == size;
+  *window = 0; *excluded = MAX_UINTN; *capacity = 0; *inputs = MAX_UINTN;
+  return AdtNode(tree, size, &at, 0, 3, &ramdisk, &trust, &addon, &policy, window, &packed, excluded, capacity, inputs) && at == size;
 }
 '''
 
@@ -54,12 +56,15 @@ with tempfile.TemporaryDirectory(prefix='darwinboot-adt-') as temporary:
                     '-I', str(driver), str(work / 'parser.c'), '-o', str(work / 'parser.dylib')], check=True)
     lib = ctypes.CDLL(str(work / 'parser.dylib'))
     lib.parse.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64),
-                          ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+                          ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+
+    def parse_all(tree):
+        window, excluded, capacity, inputs = ctypes.c_uint64(), ctypes.c_size_t(), ctypes.c_size_t(), ctypes.c_size_t()
+        ok = lib.parse(tree, len(tree), ctypes.byref(window), ctypes.byref(excluded), ctypes.byref(capacity), ctypes.byref(inputs))
+        return bool(ok), window.value, excluded.value, capacity.value, inputs.value
 
     def parse(tree):
-        window, excluded, capacity = ctypes.c_uint64(), ctypes.c_size_t(), ctypes.c_size_t()
-        ok = lib.parse(tree, len(tree), ctypes.byref(window), ctypes.byref(excluded), ctypes.byref(capacity))
-        return bool(ok), window.value, excluded.value, capacity.value
+        return parse_all(tree)[:4]
 
     none = ctypes.c_size_t(-1).value
     size = ('darwinboot-memory-size', struct.pack('<Q', 0x180000000))
@@ -92,4 +97,23 @@ with tempfile.TemporaryDirectory(prefix='darwinboot-adt-') as temporary:
     assert not parse(node('device-tree', [table], [node('chosen', [size])]))[0], 'table in the root node'
     assert not parse(node('device-tree', children=[node('chosen', [size], [node('memory-map', [table])])]))[0], 'table in memory-map'
     assert not parse(node('device-tree', children=[node('chosen', [size, table]), node('chosen', [table])]))[0], 'second chosen node'
-    print(f'PASS: window size and excluded-range table of /chosen, {len(refused) + 4} refusal cases')
+
+    # The record of the loader's inputs: two empty 32-byte records in /chosen, with or without the table.
+    record = ('darwinboot-loader-inputs', bytes(64))
+    assert parse_all(chosen(size))[4] == none
+    for tree in (chosen(record), chosen(size, table, record), chosen(record, size, table)):
+        ok, _, _, _, offset = parse_all(tree)
+        assert ok and tree[offset - 36:offset - 36 + 25] == b'darwinboot-loader-inputs\0'
+        assert struct.unpack_from('<I', tree, offset - 4)[0] == 64 and offset + 64 <= len(tree)
+    assert parse_all(chosen(size, table, record))[:4] == parse(chosen(size, table)), 'the record changes no other result'
+    refused_records = {
+        'one record': bytes(32), 'three records': bytes(96), 'empty': bytes(0), 'odd length': bytes(63),
+        'stale contents': bytes(8) + struct.pack('<Q', 0xC800000) + bytes(48), 'stale last byte': bytes(63) + b'\x01',
+    }
+    for name, value in refused_records.items():
+        assert not parse_all(chosen(size, ('darwinboot-loader-inputs', value)))[0], name
+    assert not parse_all(chosen(size, record, record))[0], 'duplicate record'
+    assert not parse_all(node('device-tree', [record], [node('chosen', [size])]))[0], 'record in the root node'
+    assert not parse_all(node('device-tree', children=[node('chosen', [size], [node('memory-map', [record])])]))[0], 'record in memory-map'
+    print(f'PASS: window size, excluded-range table and loader input record of /chosen, '
+          f'{len(refused) + 4 + len(refused_records) + 3} refusal cases')
