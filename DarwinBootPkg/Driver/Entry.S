@@ -5,6 +5,25 @@ ASM_FUNC(DarwinCurrentEl)
   mrs x0, CurrentEL
   ret
 
+// x0=PA, x1=size: write back and drop the data cache lines of a mapped range.
+ASM_FUNC(DarwinFlush)
+  cbz x1, 2f
+  add x1, x0, x1
+  mrs x2, ctr_el0
+  ubfx x2, x2, #16, #4
+  mov x3, #4
+  lsl x2, x3, x2
+  sub x3, x2, #1
+  bic x0, x0, x3
+1:
+  dc civac, x0
+  add x0, x0, x2
+  cmp x0, x1
+  b.lo 1b
+  dsb sy
+2:
+  ret
+
 // x0=boot_args PA, x1=entry PA, x2=owned PA, x3=owned size, x4=frame buffer
 // PA (0 for none), x5=its size in bytes. EL1 only.
 ASM_FUNC(DarwinEnter)

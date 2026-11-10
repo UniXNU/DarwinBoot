@@ -16,6 +16,7 @@
 #include "BootVideo.h"
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
+#include "MemoryWindow.h"
 
 #define WINDOW_SIZE  SIZE_256MB
 #define BLOCK_SIZE   SIZE_2MB
@@ -40,9 +41,21 @@ typedef struct {
   UINT64   Entry;
 } KERNEL;
 
+// Where the parts of the loaded image go, and the bytes they take from the start of the window.
+typedef struct {
+  UINT64  Args;
+  UINT64  Tree;
+  UINT64  Ramdisk;
+  UINT64  TrustCache;
+  UINT64  Addon;
+  UINT64  Policy;
+  UINT64  Used;
+} LAYOUT;
+
 STATIC EFI_HANDLE  mImage;
 UINT64 EFIAPI DarwinCurrentEl (VOID);
 VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
+VOID EFIAPI DarwinFlush (UINT64 Memory, UINT64 Size);
 
 #define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
 
@@ -270,7 +283,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
 
 STATIC
 BOOLEAN
-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
+AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PolicyOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked, UINTN *ExcludedOffset, UINTN *ExcludedCapacity)
 {
   UINT32 Properties;
   UINT32 Children;
@@ -282,6 +295,8 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   UINTN  AddonCandidate;
   UINTN  PolicyCandidate;
   UINTN  MemoryCandidate;
+  UINTN  ExcludedCandidate;
+  UINTN  ExcludedLength;
   CONST UINT8 *Name;
   UINTN  NameLength;
 
@@ -292,6 +307,8 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
   AddonCandidate = MAX_UINTN;
   PolicyCandidate = MAX_UINTN;
   MemoryCandidate = MAX_UINTN;
+  ExcludedCandidate = MAX_UINTN;
+  ExcludedLength = 0;
   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
   Properties = U32 (Data + *Offset);
   Children = U32 (Data + *Offset + 4);
@@ -333,6 +350,13 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
       MemoryCandidate = *Offset;
     }
+    // The table the loader fills with the ranges of the window XNU must not use (MemoryWindow.h): empty pairs.
+    if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-excluded") == 0) {
+      if ((ExcludedCandidate != MAX_UINTN) || (Length < 16) || (Length & 15) ||
+          !IsZeroBuffer (Data + *Offset, Length)) { return FALSE; }
+      ExcludedCandidate = *Offset;
+      ExcludedLength = Length;
+    }
     *Offset += Length;
     if (ALIGN_VALUE (*Offset, 4) > Size) { return FALSE; }
     *Offset = ALIGN_VALUE (*Offset, 4);
@@ -362,9 +386,14 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
     *WindowSize = U64 (Data + MemoryCandidate);
     if (!DarwinWindowSizeValid (*WindowSize)) { return FALSE; }
   }
+  if (ExcludedCandidate != MAX_UINTN) {
+    if ((Path != 1) || (*ExcludedOffset != MAX_UINTN)) { return FALSE; }
+    *ExcludedOffset = ExcludedCandidate;
+    *ExcludedCapacity = ExcludedLength / 16;
+  }
   if (Children > (Size - *Offset) / 8) { return FALSE; }
   for (Index = 0; Index < Children; Index++) {
-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked)) { return FALSE; }
+    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PolicyOffset, WindowSize, KeepPacked, ExcludedOffset, ExcludedCapacity)) { return FALSE; }
   }
   return TRUE;
 }
@@ -549,6 +578,99 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   return Status;
 }
 
+// The window of a kernel that accepts excluded ranges (MemoryWindow.h): the start with the most usable memory
+// inside WindowSize bytes. Only the head is allocated. The rest of the window is whatever the final memory map
+// leaves usable, so the firmware keeps the memory it needs until ExitBootServices.
+STATIC
+EFI_STATUS
+AllocateSpan (KERNEL *Kernel, UINT64 WindowSize, UINT64 HeadSize, EFI_PHYSICAL_ADDRESS *Address)
+{
+  EFI_MEMORY_DESCRIPTOR *Map;
+  EFI_STATUS            Status;
+  UINTN                 Capacity;
+  UINTN                 Size;
+  UINTN                 Key;
+  UINTN                 Stride;
+  UINT64                Candidate;
+  UINT64                Usable;
+  UINT64                SkipUsable;
+  UINT64                SkipAddress;
+  CHAR16                Line[96];
+
+  *Address = 0;
+  Map = NULL;
+  Capacity = 0;
+  Status = GetMap (&Map, &Capacity, &Size, &Key, &Stride);
+  if (EFI_ERROR (Status)) { if (Map != NULL) { FreePool (Map); } return Status; }
+  SkipUsable = MAX_UINT64;
+  SkipAddress = 0;
+  for (;;) {
+    Candidate = DarwinWindowStart (Map, Size, Stride, BLOCK_SIZE, Kernel->Base & (BLOCK_SIZE - 1), HeadSize, WindowSize,
+                                   SkipUsable, SkipAddress, &Usable);
+    if (Candidate == 0) { Status = EFI_OUT_OF_RESOURCES; break; }
+    SkipUsable = Usable;
+    SkipAddress = Candidate;
+    Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (HeadSize), &Candidate);
+    if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
+  }
+  if (EFI_ERROR (Status)) {
+    UnicodeSPrint (Line, sizeof (Line), L"NO WINDOW %lx HEAD %lx", WindowSize, HeadSize);
+    DiagDraw (Line, 0);
+  }
+  FreePool (Map);
+  return Status;
+}
+
+// The image behind the kernel: boot arguments, device tree, RAM disk, trust caches, GPU addon, root policies.
+// Every boundary is aligned to at most 16 KiB, so the bytes used are the same at every address that has the
+// kernel's offset inside a 2 MiB block.
+STATIC
+VOID
+PlaceImage (
+  UINT64        Address,
+  CONST KERNEL  *Kernel,
+  UINTN         TreeSize,
+  UINTN         RamdiskBytes,
+  UINTN         TrustCacheSize,
+  UINTN         AddonSize,
+  UINTN         PolicySize,
+  LAYOUT        *Layout
+  )
+{
+  Layout->Args = ALIGN_VALUE (Address + Kernel->End - Kernel->Base, SIZE_16KB);
+  Layout->Tree = Layout->Args + EFI_PAGE_SIZE;
+  Layout->Ramdisk = ALIGN_VALUE (Layout->Tree + TreeSize, EFI_PAGE_SIZE);
+  Layout->TrustCache = Layout->Ramdisk + RamdiskBytes;
+  Layout->Addon = ALIGN_VALUE (Layout->TrustCache + TrustCacheSize, SIZE_16KB);
+  Layout->Policy = ALIGN_VALUE (Layout->Addon + AddonSize, SIZE_16KB);
+  Layout->Used = ALIGN_VALUE (Layout->Policy + PolicySize, SIZE_16KB) - Address;
+}
+
+// Fill the device tree's table from a memory map and report the usable bytes as the memory size. FALSE when the
+// head is no longer whole, which the head allocation rules out.
+STATIC
+BOOLEAN
+DescribeWindow (
+  CONST VOID        *Map,
+  UINTN             MapSize,
+  UINTN             Stride,
+  UINT64            Address,
+  UINT64            WindowSize,
+  UINT64            HeadSize,
+  UINT8             *Table,
+  UINTN             Capacity,
+  DARWIN_BOOT_ARGS  *Args,
+  UINTN             *Count
+  )
+{
+  UINT64 Excluded;
+
+  if (DarwinRunEnd (Map, MapSize, Stride, FALSE, Address, Address + HeadSize) != Address + HeadSize) { return FALSE; }
+  *Count = DarwinWindowExclusions (Map, MapSize, Stride, Address, WindowSize, Table, Capacity, &Excluded);
+  Args->MemorySizeActual = WindowSize - Excluded;
+  return TRUE;
+}
+
 STATIC
 EFI_STATUS
 EFIAPI
@@ -602,6 +724,14 @@ Boot (
   UINTN                           Attempt;
   CHAR8                           CommandLine[1024];
   UINT64                          Video[6];
+  LAYOUT                          Layout;
+  UINTN                           ExcludedOffset;
+  UINTN                           ExcludedCapacity;
+  UINTN                           ExcludedCount;
+  UINT8                           *Excluded;
+  UINT64                          HeadSize;
+  UINT64                          Allocated;
+  UINT64                          Cursor;
 
   (VOID)This;
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
@@ -635,6 +765,10 @@ Boot (
   TreePath = NULL;
   Map = NULL;
   Address = 0;
+  Allocated = 0;
+  HeadSize = 0;
+  Excluded = NULL;
+  ExcludedCount = 0;
   Capacity = 0;
   Status = gBS->HandleProtocol (Request->Volume, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
   if (EFI_ERROR (Status)) { return Status; }
@@ -658,7 +792,9 @@ Boot (
   PolicyOffset = MAX_UINTN;
   WindowSize = 0;
   KeepPacked = FALSE;
-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+  ExcludedOffset = MAX_UINTN;
+  ExcludedCapacity = 0;
+  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked, &ExcludedOffset, &ExcludedCapacity) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
@@ -722,16 +858,25 @@ Boot (
   }
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
-  Status = AllocateWindow (&Kernel, WindowSize, &Address);
-  if (EFI_ERROR (Status)) { goto Fail; }
-  ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
-  TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
-  RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
   RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
-  TrustCacheAddress = RamdiskAddress + RamdiskBytes;
-  AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
-  PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
-  Used = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_16KB) - Address;
+  if (ExcludedOffset == MAX_UINTN) {
+    Status = AllocateWindow (&Kernel, WindowSize, &Address);
+    Allocated = WindowSize;
+  } else {
+    PlaceImage (BLOCK_SIZE + (Kernel.Base & (BLOCK_SIZE - 1)), &Kernel, TreeSize, RamdiskBytes, TrustCacheSize, AddonSize, PolicySize, &Layout);
+    HeadSize = ALIGN_VALUE (Layout.Used + DARWIN_WINDOW_RESERVE (WindowSize), EFI_PAGE_SIZE);
+    Status = AllocateSpan (&Kernel, WindowSize, HeadSize, &Address);
+    Allocated = HeadSize;
+  }
+  if (EFI_ERROR (Status)) { goto Fail; }
+  PlaceImage (Address, &Kernel, TreeSize, RamdiskBytes, TrustCacheSize, AddonSize, PolicySize, &Layout);
+  ArgsAddress = Layout.Args;
+  TreeAddress = Layout.Tree;
+  RamdiskAddress = Layout.Ramdisk;
+  TrustCacheAddress = Layout.TrustCache;
+  AddonAddress = Layout.Addon;
+  PolicyAddress = Layout.Policy;
+  Used = Layout.Used;
   if (Used > WindowSize - BLOCK_SIZE) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
@@ -787,6 +932,19 @@ Boot (
   if (EFI_ERROR (Status)) { goto Fail; }
   Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
          Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
+  if (ExcludedOffset != MAX_UINTN) {
+    // The table as this map gives it; the map ExitBootServices accepts decides the one XNU reads.
+    Excluded = (UINT8 *)(UINTN)(TreeAddress + ExcludedOffset);
+    if (!DescribeWindow (Map, MapSize, Stride, Address, WindowSize, HeadSize, Excluded, ExcludedCapacity, Args, &ExcludedCount)) {
+      Status = EFI_LOAD_ERROR;
+      goto Fail;
+    }
+    Print (L"DARWINBOOT: window head=0x%lx usable=0x%lx excluded ranges=%lu of %lu\n",
+           HeadSize, Args->MemorySizeActual, (UINT64)ExcludedCount, (UINT64)ExcludedCapacity);
+    for (Index = 0; Index < ExcludedCount; Index++) {
+      Print (L"DARWINBOOT: excluded 0x%lx + 0x%lx\n", DarwinRangeBase (Excluded, Index), DarwinRangeSize (Excluded, Index));
+    }
+  }
   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
   Print (L"DARWINBOOT: command line: %a\n", CommandLine);
@@ -801,6 +959,9 @@ Boot (
   DEBUG ((DEBUG_ERROR, "kernel   va 0x%lx  pa 0x%lx\n", Kernel.Base, Address));
   DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + Kernel.Entry - Kernel.Base));
   DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize));
+  if (Excluded != NULL) {
+    DEBUG ((DEBUG_ERROR, "memory   usable 0x%lx  excluded ranges %lu\n", Args->MemorySizeActual, (UINT64)ExcludedCount));
+  }
   DEBUG ((DEBUG_ERROR, "video    base 0x%lx  %lux%lu  row %lu bytes  %lu bpp\n", Video[0], Video[3], Video[4], Video[2], Video[5]));
   DEBUG ((DEBUG_ERROR, "entry words %08x %08x %08x %08x\n",
           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
@@ -819,9 +980,27 @@ Boot (
       if (Attempt == 0) { goto Fail; }
       CpuDeadLoop ();
     }
+    // No boot service runs between this map and ExitBootServices, so the table describes the memory XNU gets.
+    if ((Excluded != NULL) &&
+        !DescribeWindow (Map, MapSize, Stride, Address, WindowSize, HeadSize, Excluded, ExcludedCapacity, Args, &ExcludedCount)) {
+      if (Attempt == 0) { Status = EFI_LOAD_ERROR; goto Fail; }
+      CpuDeadLoop ();
+    }
     Status = gBS->ExitBootServices (mImage, Key);
     if (!EFI_ERROR (Status)) {
-      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
+      if (Excluded == NULL) {
+        DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
+        CpuDeadLoop ();
+      }
+      // The usable memory behind the head leaves the data cache as the head does in DarwinEnter. An excluded
+      // range is not touched: the firmware may not even map it.
+      Cursor = Address + HeadSize;
+      for (Index = 0; Index < ExcludedCount; Index++) {
+        if (DarwinRangeBase (Excluded, Index) > Cursor) { DarwinFlush (Cursor, DarwinRangeBase (Excluded, Index) - Cursor); }
+        Cursor = DarwinRangeBase (Excluded, Index) + DarwinRangeSize (Excluded, Index);
+      }
+      if (Address + WindowSize > Cursor) { DarwinFlush (Cursor, Address + WindowSize - Cursor); }
+      DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, HeadSize, Video[0], Video[2] * Video[4]);
       CpuDeadLoop ();
     }
     if (Status != EFI_INVALID_PARAMETER) { CpuDeadLoop (); }
@@ -837,7 +1016,7 @@ Fail:
   if (Policies != NULL) { FreePool (Policies); }
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
-  if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
+  if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (Allocated)); }
   Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
   return Status;
 }

@@ -10,6 +10,7 @@
 [Sources]
   DarwinBoot.c
   PackedRamdisk.h
+  MemoryWindow.h
   BootArgs.h
   BootVideo.h
   DiagFont.h
