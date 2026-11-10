@@ -19,6 +19,9 @@
 
 #define WINDOW_SIZE  SIZE_256MB
 #define BLOCK_SIZE   SIZE_2MB
+// The largest kernel file read: the default window. A macOS kernel collection is about 137 MiB; the window check
+// below still bounds the kernel with everything placed after it.
+#define KERNEL_LIMIT SIZE_256MB
 #define MAX_SEGMENTS 64
 
 typedef struct {
@@ -637,7 +640,7 @@ Boot (
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
-  Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
+  Status = ReadFile (Root, Request->KernelPath, KERNEL_LIMIT, &Image, &ImageSize);
   if (EFI_ERROR (Status)) { goto Fail; }
   Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
